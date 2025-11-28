@@ -10,10 +10,6 @@ __all__ = ["Spider", "spider", "make_closure"]
 
 
 def make_closure(model, loss_fn, batch):
-    r"""Helper to produce a closure that reuses a given batch.
-
-    This ensures repeated calls to the closure use identical data (required by Spider).
-    """
     inputs, targets = batch
 
     def closure():
@@ -50,7 +46,7 @@ class Spider(Optimizer):
 
         super().__init__(params, defaults)
 
-        # Global step counter for the optimizer (clearer than per-param ad-hoc step fields)
+        # Global step counter for the optimizer 
         self.state.setdefault("_step", 0)
 
     def __setstate__(self, state):
@@ -60,7 +56,6 @@ class Spider(Optimizer):
             group.setdefault("foreach", None)
             group.setdefault("differentiable", False)
 
-        # Ensure the global step exists after loading state
         self.state.setdefault("_step", 0)
 
     @_use_grad_for_differentiable
@@ -69,7 +64,7 @@ class Spider(Optimizer):
         if closure is None:
             raise RuntimeError("Spider requires a closure argument (which must reuse the same batch).")
 
-        # Use a global step counter (stored in optimizer state)
+        # Use a global step counter 
         step_count = self.state.get("_step", 0)
         update_frequency = self.param_groups[0]["freq"]
 
@@ -81,7 +76,6 @@ class Spider(Optimizer):
                 )
 
             # Compute gradients on the large batch / full dataset.
-            # Sets p.grad = \nabla f(x_t)
             with torch.enable_grad():
                 self.zero_grad()
                 loss = full_grad_closure()
@@ -93,15 +87,9 @@ class Spider(Optimizer):
                         continue
 
                     state = self.state[p]
-
-                    # Save estimator = gradient at current x_t
                     state["estimator"] = p.grad.detach().clone()
-
-                    # Save prev_param = x_t (as a buffer for next iterations)
-                    # Ensure clone is on correct device and dtype
+                
                     state["prev_param"] = p.detach().clone().to(p.device).to(p.dtype)
-
-                    # Apply update step: x_{t+1} = x_t - lr * v_t
                     with torch.no_grad():
                         if group["maximize"]:
                             p.add_(state["estimator"], alpha=group["lr"])
@@ -113,12 +101,10 @@ class Spider(Optimizer):
             return loss
 
 
-        # 1. Calculate gradient at current weights: ∇f_S(x_t)
         with torch.enable_grad():
             self.zero_grad()
             loss = closure()
 
-        # Save these gradients (detached clones)
         current_grads_buffer: List[List[Optional[Tensor]]] = []
         for group in self.param_groups:
             group_grads: List[Optional[Tensor]] = []
@@ -129,25 +115,23 @@ class Spider(Optimizer):
                     group_grads.append(None)
             current_grads_buffer.append(group_grads)
 
-        # 2. Swap weights: load x_{t-1} into the model (backup current params first)
+        # Swap weights: load x_{t-1} into the model 
         current_params_buffer: List[Tensor] = []
         for group in self.param_groups:
             for p in group["params"]:
                 state = self.state.get(p, {})
                 if "prev_param" in state:
-                    # Backup current param (x_t) and then load prev_param (x_{t-1})
+                    # Backup current param 
                     current_params_buffer.append(p.data.clone())
                     with torch.no_grad():
-                        # copy_ expects device/dtype match; prev_param was created with matching device/dtype above
                         p.data.copy_(state["prev_param"])
 
-        # 3. Calculate gradient at previous weights: ∇f_S(x_{t-1})
-        # Using the same batch (closure must ensure it)
+        #  Calculate gradient at previous weights
         with torch.enable_grad():
             self.zero_grad()
             loss_prev = closure()  # explicit capture for clarity
 
-        # 4. Swap weights back: restore x_t from backup
+        # Swap weights back
         idx = 0
         for group in self.param_groups:
             for p in group["params"]:
@@ -160,10 +144,11 @@ class Spider(Optimizer):
         # 5. Build lists and call functional update
         for i, group in enumerate(self.param_groups):
             params_list: List[Tensor] = []
-            grads_prev_list: List[Tensor] = []  # ∇f_S(x_{t-1}) (from p.grad after step 3)
+            grads_prev_list: List[Tensor] = []  # ∇f_S(x_{t-1}) 
             grads_curr_list: List[Tensor] = []  # ∇f_S(x_t) (from buffer)
             estimator_list: List[Tensor] = []   # v_{t-1} (in state)
             prev_params_list: List[Tensor] = [] # buffers to update to x_t for next step
+            # above are sent to spider function which does the updating
 
             current_group_grads = current_grads_buffer[i]
 
@@ -196,17 +181,9 @@ class Spider(Optimizer):
                     foreach=group["foreach"],
                 )
 
-        # Increment global step and return the loss on x_t (from the first closure call)
+        # Increment global step and return the loss on x_t
         self.state["_step"] = step_count + 1
         return loss
-
-
-Spider.__doc__ = Spider.__doc__ + """
-Notes:
-- The inner loop calls the provided closure twice and therefore the closure must reuse the same mini-batch.
-- Use make_closure(model, loss_fn, batch) to create a closure bound to a single batch.
-"""
-
 
 def spider(
     params: List[Tensor],
@@ -270,29 +247,23 @@ def _single_tensor_spider(
         g_prev = grads_prev[i]
         v_old = estimators[i]
         x_prev_buffer = prev_params[i]
-
-        # grads passed in should already be detached/cloned by the caller
         if maximize:
-            # flip signs for maximize (do not modify original tensors - operate on clones)
+            # flip signs for maximize 
             g_curr = -g_curr
             g_prev = -g_prev
 
-        # 1. Update Estimator (Path Integration)
         # v_t = (g_curr - g_prev) + v_{t-1}
-        diff = g_curr.sub(g_prev)  # produces a fresh tensor (g_curr and g_prev are detached clones)
-
-        # v_new = v_old + diff (in-place)
+        diff = g_curr.sub(g_prev)  
         v_old.add_(diff)
 
-        # 2. Update previous param buffer (save current parameter for next step)
-        # copy current param into x_prev_buffer
+        # Update previous param buffer (save current parameter for next step)
         with torch.no_grad():
             x_prev_buffer.copy_(param)
 
         # 3. Update parameters: x = x - lr * v
         with torch.no_grad():
             if maximize:
-                param.add_(v_old, alpha=lr)  # v_old now v_new
+                param.add_(v_old, alpha=lr)  # v_old is now v_new
             else:
                 param.add_(v_old, alpha=-lr)
 
@@ -334,27 +305,27 @@ def _multi_tensor_spider(
                 device_grads_curr = [ -g for g in device_grads_curr ]
                 device_grads_prev = [ -g for g in device_grads_prev ]
 
-        # 1. diff = g_curr - g_prev (foreach)
+        # diff = g_curr - g_prev (foreach)
         try:
             diff = torch._foreach_sub(device_grads_curr, device_grads_prev)
         except Exception:
             diff = [a - b for a, b in zip(device_grads_curr, device_grads_prev)]
 
-        # 2. v = v + diff (in-place foreach add)
+        # v = v + diff (in-place foreach add)
         try:
             torch._foreach_add_(device_estimators, diff)
         except Exception:
             for v, d in zip(device_estimators, diff):
                 v.add_(d)
 
-        # 3. x_prev <- x_curr (copy current param values into prev_param buffers)
+        # x_prev <- x_curr (copy current param values into prev_param buffers)
         try:
             torch._foreach_copy_(device_prev_params, device_params)
         except Exception:
             for prev_buf, p in zip(device_prev_params, device_params):
                 prev_buf.copy_(p)
 
-        # 4. x = x - lr * v
+        #  x = x - lr * v
         alpha = lr if maximize else -lr
         try:
             torch._foreach_add_(device_params, device_estimators, alpha=alpha)
